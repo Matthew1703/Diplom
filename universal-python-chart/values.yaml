@@ -1,0 +1,191 @@
+---
+# Default values for universal-python.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+deployment:
+  enabled: true
+
+configMap:
+  enabled: false
+  volumeName: ""
+  mountPath: ""
+  name: ""
+
+migrations:
+  enabled: false
+  customAnnotations:
+    helm.sh/hook-weight: "3"
+    aad: ad
+  pullPolicy: Always
+  restartPolicy: Never
+  resourceLimits:
+    resources:
+      limits:
+        cpu: "100m"
+        memory: "100Mi"
+      requests:
+        cpu: "100m"
+        memory: "100Mi"
+  command: ["/bin/bash", "upgrade.sh"]
+  env:
+    name: ""
+    value: ""
+
+application:
+  instance: "test"
+  ports:
+    http: 8000
+  env:
+    POSTGRES_DSN: ""
+    ARTIFACTORY_URL: ""
+    MIN_PRODUCT_DESCRIPTION_LEN: ""
+    INSIDER_API_URL: ""
+    ADMIN_TOKEN: ""
+    NOTIFICATION_CONTROLLER_URL: ""
+    MARKETPLACE_URL: ""
+
+replicaCount: 3
+image:
+  registry: artifactory.raiffeisen.ru
+  repository: ext-devops-community-docker
+  name: universal-python
+  nameMigration: universal-python-migration
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+imagePullSecrets:
+  - name: docker-registry-auth-secret
+
+nameOverride: "universal-python"
+fullnameOverride: "universal-python"
+
+serviceAccount:
+  create: false
+  annotations: {}
+  name: ""
+
+deploymentAnnotations: {}
+
+reloaderAnnotations:
+  enabled: false
+  customannotations: {}
+
+podAnnotations: {}
+
+customChecksum: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  # runAsNonRoot: true
+  # runAsUser: 1000
+  # runAsGroup: 1000
+  # fsGroup: 1000
+  allowPrivilegeEscalation: false
+
+service:
+  enabled: false
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: "vaultpki-clusterissuer"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+  http:
+    hosts: universal-python.raiffeisen.ru
+    path: /
+    pathType: ImplementationSpecific
+  tls:
+    secretName: pc-tls
+    hosts: universal-python.raiffeisen.ru
+
+resources:
+  limits:
+    cpu: 250m
+    memory: 256Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+probes:
+  liveness:
+    path: /api/status/liveness
+    port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 10
+  readiness:
+    path: /api/status/readiness
+    port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    failureThreshold: 3
+  startup:
+    path: /api/status/readiness
+    port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    failureThreshold: 3
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+monitoring:
+  podmonitor:
+    enabled: false
+    port: http
+    interval: 60s
+    path: /metrics
+    scrapeTimeout: 5s
+
+externalSecret:
+  enabled: false
+  namespace: "your-namespace"
+  spec:
+    secretStoreRef:
+      name: vault
+      kind: ClusterSecretStore
+    refreshInterval: "1h"
+    secretData:
+      secret1:
+        path: ""
+        property: ""
+      secret2:
+        path: ""
+        property: ""
+
+logging:
+  enabled: false
+  namespace: "your-namespace"
+  output:
+    brokers: "your-broker-url" 
+    defaultTopic: "your-default-topic"
+    buffer:
+      flush_thread_count: 8
+      timekey: 1m
+      timekey_wait: 10s
+  flow:
+    application_name: "your_app_name"
+    parser:
+      key_name: "log"
+      reserve_time: true
+      reserve_data: true
+      remove_key_name_field: true
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
