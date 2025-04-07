@@ -1,0 +1,617 @@
+---
+  include:
+    - project: "devops_community/the-way-of-cicd"
+      ref: '6.8.0'
+      file:
+        - "all-latest-stages/define-registry/define-registry.yml"
+        - "all-latest-stages/version/version.yml"
+        - "all-latest-stages/code-scan/code-scan.yml"
+        - "all-latest-stages/build/build-package.yml"
+        - "all-latest-stages/deploy/deploy.yml"
+        - "all-latest-stages/release/release.yml"
+        - "all-latest-stages/test/allure/send-report.yml"
+        - "all-latest-stages/pipeline/pipeline.yml"
+    - project: "appsec/platform/cicd"
+      file: "main.yml"
+    - local: "variables.yml"
+  
+  workflow:
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+        variables:
+          SKIP_JOBS_FOR_MR: 'true'
+          DEPLOY_MANUALLY: 'false'
+      - if: $CI_COMMIT_TAG
+        when: never
+      - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+        variables:
+          APPSEC_SKIP: 'true'
+          SKIP_DEPLOY_PROD_1: 'true'
+          SKIP_DEPLOY_PROD_2: 'true'
+          SKIP_RELEASE: 'true'
+      - when: always
+  
+  stages:
+    - prepare
+    - cache
+    - test
+    - code-scan
+    - migration
+    - build
+    - clean-up
+    - appsec
+    - deploy-test
+    - deploy-preview
+    - deploy-production
+    - release
+  
+  cache: &poetryCache
+      key:
+        files:
+          - poetry.lock
+        prefix: "${CI_PROJECT_NAME}-poetry"
+      paths:
+        - .venv
+      policy: pull
+  
+  version:
+    stage: prepare
+    image: artifactory.raiffeisen.ru/ext-devops-community-docker/gitversion:6.0.0
+    variables:
+      GIT_STRATEGY: clone
+      GIT_DEPTH: 0
+    before_script:
+    - |
+      if [[ ! -f "GitVersion.yml" ]]
+      then
+        cat <<EOF > GitVersion.yml
+        mode: ContinuousDeployment
+        major-version-bump-message: 'branch\s?''(breaking|major).*into\s?''(master|main)'''
+        minor-version-bump-message: 'branch\s?''(feature|minor).*into\s?''(master|main)'''
+        patch-version-bump-message: 'branch\s?''(fix|bugfix|hotfix|patch).*into\s?''(master|main)'''
+        no-bump-message: 'branch\s?''(none|skip).*into\s?''(master|main)'''
+        commit-message-incrementing: Enabled
+        branches:
+          feature:
+            increment: Patch
+          hotfix:
+            increment: Patch
+          unknown:
+            increment: Patch
+        strategies:
+        - Mainline
+      EOF
+      fi
+  script:
+    - |
+      if [ -z "$CI_COMMIT_TAG" ]
+      then
+          if [[ -f "majorVersion" ]]
+          then
+            MAJOR_VERSION=$(cat majorVersion | grep MAJOR_VERSION | cut -d '=' -f 2)
+          else
+            MAJOR_VERSION=0
+          fi
+      fi
+    - |
+      if [ -z "$CI_COMMIT_TAG" ]
+      then
+          git fetch --all
+          if (( ${MAJOR_VERSION} > $(gitversion /showvariable Major) ))
+          then
+              VERSION=${MAJOR_VERSION}.0.0
+          else
+              VERSION=$(gitversion /showvariable MajorMinorPatch)
+          fi
+      else
+          VERSION=${CI_COMMIT_TAG}
+      fi
+    - |
+      if [ -z "$CI_COMMIT_TAG" ]
+      then
+          if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]
+          then
+            echo "VERSION=${VERSION}" > version.env
+          else
+            echo "VERSION=$VERSION-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" > version.env
+          fi
+      else
+          echo "VERSION=${VERSION}" > version.env
+      fi
+      sed -e 's/=/: /' version.env
+  rules:
+    - if: $SKIP_VERSION != "true" && $SKIP_JOBS_FOR_MR != "true"
+  interruptible: true
+  
+  define_docker_registry:
+    stage: prepare
+    image: $ALPINE_IMAGE
+    variables:
+      REPO: "REGISTRY"
+      RELEASE_VAR_NAME: "DOCKER_REGISTRY"
+      SNAPSHOT_VAR_NAME: "DOCKER_REGISTRY_SNAPSHOT"
+    script:
+      - |
+        REPLACE_REPO_NAME_FL=false
+        if [[ ! -v REPO ]]
+        then
+          REPO=`echo ${PREFIX}_REPO`
+          REPLACE_REPO_NAME_FL=true
+        fi
+        if [ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ] || [ $CI_COMMIT_TAG ]
+        then
+          REPO_VAR_NAME=`echo $RELEASE_VAR_NAME`
+        else
+          REPO_VAR_NAME=`echo $SNAPSHOT_VAR_NAME`
+        fi
+        eval "$REPO=\$$REPO_VAR_NAME"
+        if [ "$REPLACE_REPO_NAME_FL" = true ]
+        then
+          echo "${PREFIX}_REPO=${!REPO}" | tee repo.env
+        else
+          echo "${REPO}=${!REPO}" | tee repo.env
+        fi
+    artifacts:
+      reports:
+        dotenv:
+          - ./repo.env
+    tags:
+      - shared_linux_small_v1
+    rules:
+      - if: $SKIP_REGISTRY != "true" && $SKIP_JOBS_FOR_MR != "true"
+    interruptible: true
+  
+  automatic_assign_reviewers:
+    stage: prepare
+    image: $CLI_TOOLS_IMAGE
+    variables:
+      AUTO_ASSIGN_REVIEWERS: "${SKIP_ASSIGN_REVIEWERS}"
+      REVIEWERS_LIST: "${REVIEWERS_USERS_LIST}"
+      REVIEWERS_GROUP_ID: "${REVIEWERS_GITLAB_GROUP_ID}"
+      AUTO_ASSIGN_REVIEWERS: false
+      AUTO_ASSIGN_AUTHOR: false
+      GITLAB_API_URL: "https://gitlabci.raiffeisen.ru/api/v4"
+    script:
+    - |
+      #!/bin/sh
+
+      get_reviewers_from_group() {
+        curl --silent --header "PRIVATE-TOKEN: $GITLAB_REVIEW_TOKEN" "$GITLAB_API_URL/groups/${REVIEWERS_GROUP_ID}/members" \
+        | jq -r '.[] | select(.id != 1 and .id != '$GITLAB_USER_ID') | .id'
+      }
+
+      get_user_ids_by_logins() {
+        local ids=""
+
+        logins=$(echo "$1" | jq -r '.[]')
+
+        for login in $logins; do
+          user_id=$(curl --silent --header "PRIVATE-TOKEN: $GITLAB_REVIEW_TOKEN" "$GITLAB_API_URL/users?username=$login" | jq -r '.[0].id')
+          if [[ "$user_id" != "1" && "$user_id" != "$GITLAB_USER_ID" ]]; then
+            ids+="$user_id,"
+          fi
+        done
+
+        echo "${ids%,}"
+      }
+
+      if [ -n "${REVIEWERS_LIST}" ]; then
+        REVIEWERS=$(get_user_ids_by_logins "$REVIEWERS_LIST")
+      elif [ -n "${REVIEWERS_GROUP_ID}" ]; then
+        REVIEWERS=$(get_reviewers_from_group)
+      else
+        echo "REVIEWERS_LIST OR REVIEWERS_GROUP_ID IS NONE"
+        exit 0
+      fi
+
+      if [ -z "$REVIEWERS" ]; then
+        echo "REVIEWERS IS EMPTY"
+        exit 0
+      fi
+
+      MR_IID=$(curl --silent \
+      --header "PRIVATE-TOKEN: $GITLAB_REVIEW_TOKEN" \
+      "$GITLAB_API_URL/projects/$CI_PROJECT_ID/merge_requests?source_branch=$CI_COMMIT_REF_NAME" \
+      | jq '.[] | select(.sha == "'"$CI_COMMIT_SHA"'") | .iid' | head -n 1)
+
+      if [ -z "$MR_IID" ]; then
+        echo "Merge request IID is not found"
+        exit 0
+      fi
+
+      CURRENT_REVIEWERS=$(curl --silent \
+      --header "PRIVATE-TOKEN: $GITLAB_REVIEW_TOKEN" \
+      "$GITLAB_API_URL/projects/$CI_PROJECT_ID/merge_requests/$MR_IID" \
+      | jq -r '.reviewers[].id' | paste -sd "," -)
+
+      if [ -z "$CURRENT_REVIEWERS" ]; then
+        CURRENT_REVIEWERS=""
+      fi
+
+      ALL_REVIEWERS=$(echo "$CURRENT_REVIEWERS,$REVIEWERS" | tr ',' '\n' | sort -u | paste -sd "," -)
+
+      REVIEWER_IDS=$(echo $ALL_REVIEWERS | tr ',' ' ' | sed 's/^/reviewer_ids[]=/' | tr ' ' ',')
+
+      curl -X PUT --output /dev/null --header "PRIVATE-TOKEN: $GITLAB_REVIEW_TOKEN" \
+      --data "$REVIEWER_IDS" "$GITLAB_API_URL/projects/$CI_PROJECT_ID/merge_requests/$MR_IID"
+
+      echo "SUCCESSFUL ASSIGN REVIEWERS"
+
+      if [ "$AUTO_ASSIGN_AUTHOR" = "true" ]; then
+        MR_AUTHOR_ID=$(curl --silent --header "PRIVATE-TOKEN: $GITLAB_REVIEW_TOKEN" "$GITLAB_API_URL/projects/$CI_PROJECT_ID/merge_requests/$MR_IID" | jq -r '.author.id')
+        if [ "$MR_AUTHOR_ID" != "null" ] && [ -n "$MR_AUTHOR_ID" ] && [ "$MR_AUTHOR_ID" != "1" ]; then
+          assignee_data=$(echo "{\"assignee_ids\": [$MR_AUTHOR_ID]}" | jq -c .)
+          response=$(curl -X PUT --silent --header "PRIVATE-TOKEN: $GITLAB_REVIEW_TOKEN" --header "Content-Type: application/json" --data "$assignee_data" "$GITLAB_API_URL/projects/$CI_PROJECT_ID/merge_requests/$MR_IID")
+          status_code=$?
+          if [ "$status_code" -ne 0 ] || echo "$response" | grep -q '"error"'; then
+            echo "Error updating assignee: $response"
+            exit 1
+          fi
+          echo "Assignee updated successfully"
+        else
+          echo "Author ID is invalid"
+        fi
+      fi
+
+      echo "SUCCESSFUL ASSIGN REVIEWERS AND/OR AUTHOR"
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      - if: $SKIP_ASSIGN_REVIEWERS != "true"
+    interruptible: true
+  
+  define-cache:
+    stage: cache
+    script:
+      - >
+        CMD="$LOCAL_POETRY_ARGS" 
+      - eval $CMD 
+      - poetry config http-basic.raif ${ARTIFACTORY_USER} ${ARTIFACTORY_PASSWORD}
+      - poetry config http-basic.team-name ${ARTIFACTORY_USER} ${ARTIFACTORY_PASSWORD}
+      - poetry config virtualenvs.in-project true
+      - poetry install
+    rules:
+      - when: always
+    needs: []
+    interruptible: true
+  
+  define-test:
+    stage: test
+    image: $PYTHON_IMAGE
+    cache:
+      <<: *poetryCache
+    environment:
+      name: "test"
+    script:
+      - |
+        #!/bin/sh
+        if [ "${ENABLE_ALLURE}" == "true" ]; then
+          poetry run pytest --cov-fail-under=${PYTEST_COVER_PERCENT} tests/ --alluredir $ALLURE_REPORT_DIR
+        else
+          poetry run pytest --cov-fail-under=${PYTEST_COVER_PERCENT} tests/
+        fi
+    coverage: '/TOTAL.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+    artifacts:
+      when: always
+      paths:
+        - "reports/junit.xml"
+        - "reports/coverage.xml"
+        - "${ALLURE_REPORT_DIR}"
+      reports:
+        junit: "reports/junit.xml"
+        coverage_report:
+          coverage_format: cobertura
+          path: "reports/coverage.xml"
+    rules:
+      - when: always
+    interruptible: true
+  
+  define-migration:
+    stage: migration
+    image: $PYTHON_IMAGE
+    cache:
+      <<: *poetryCache
+    script:
+      - echo "REVISION=$(.venv/bin/alembic heads | cut -d " " -f1)" >> REVISIONS.env
+      - echo "ROLLBACK_REVISION=$(.venv/bin/alembic show $(.venv/bin/alembic heads |
+        cut -d " " -f1) |
+        grep "Parent" |
+        cut -d " " -f2 |
+        tr -d \<,\> )" >> REVISIONS.env
+      - cat REVISIONS.env
+    rules:
+      - if: $SKIP_MIGRATION != "true" && $SKIP_JOBS_FOR_MR != "true"
+    artifacts:
+      reports:
+        dotenv:
+          - "./REVISIONS.env"
+    needs:
+      - job: define-cache
+    interruptible: true
+  
+  build-app-migration-image:
+    stage: build
+    image: $KANIKO_IMAGE
+    cache:
+      <<: *poetryCache
+    variables:
+      OCI_REGISTRY: "$REGISTRY"
+      IMAGE_NAME: "${CI_PROJECT_NAME}"
+      IMAGE_TAG: "$VERSION"
+      DESTINATION: "$ARTIFACTORY_SERVER/$OCI_REGISTRY/${IMAGE_NAME}-migration:$IMAGE_TAG"
+      ARTIFACTORY_SERVER: "artifactory.raiffeisen.ru"
+      DOCKERFILE: $DOCKERFILE_MIGRATION
+      DOCKER_BUILD_ARGS: >-
+        --build-arg BUILD_ENVIRONMENT=gitlab
+        --build-arg REVISION=${REVISION}
+        --build-arg ROLLBACK_REVISION=${ROLLBACK_REVISION}
+        --skip-unused-stages
+        --target app-migration-image
+    script:
+      - echo "{\"auths\":{\"$ARTIFACTORY_SERVER\":{\"username\":\"$ARTIFACTORY_USER\",\"password\":\"$ARTIFACTORY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+      - >
+        CMD="/kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile $CI_PROJECT_DIR/$DOCKERFILE
+        --destination $DESTINATION
+        --build-arg ARTIFACTORY_USER='$ARTIFACTORY_USER'
+        --build-arg ARTIFACTORY_PASSWORD='$ARTIFACTORY_PASSWORD'
+        $DOCKER_BUILD_ARGS"
+      - eval $CMD
+    rules:
+      - if: $SKIP_MIGRATION != "true" && $SKIP_JOBS_FOR_MR != "true"
+    dependencies:
+      - define_docker_registry
+      - version
+      - define-migration
+  
+  build-image:
+    stage: build
+    cache:
+      <<: *poetryCache
+    variables:
+      OCI_REGISTRY: "$REGISTRY"
+      IMAGE_NAME: "${CI_PROJECT_NAME}"
+      IMAGE_TAG: "$VERSION"
+      DOCKERFILE: $DOCKERFILE_LOCAL
+      ARTIFACTORY_SERVER: "artifactory.raiffeisen.ru"
+      DOCKER_BUILD_ARGS: >-
+        --build-arg BUILD_ENVIRONMENT=gitlab
+        --skip-unused-stages
+        --target app-image
+    script:
+      - echo "{\"auths\":{\"$ARTIFACTORY_SERVER\":{\"username\":\"$ARTIFACTORY_USER\",\"password\":\"$ARTIFACTORY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+      - >
+        CMD="/kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile $CI_PROJECT_DIR/$DOCKERFILE
+        --destination $DESTINATION
+        --build-arg ARTIFACTORY_USER='$ARTIFACTORY_USER'
+        --build-arg ARTIFACTORY_PASSWORD='$ARTIFACTORY_PASSWORD'
+        $DOCKER_BUILD_ARGS"
+      - eval $CMD
+    rules:
+      - if: $SKIP_BUILD != "true" && $SKIP_JOBS_FOR_MR != "true"
+    dependencies:
+      - define_docker_registry
+      - version
+  
+  .deploy_base:
+    before_script:
+      - werf kubectl create namespace "${WERF_NAMESPACE}" || true
+      - |
+        if [ -n "${PROMETHEUS_NAMESPACE_LABEL}" ]; then
+          werf kubectl label namespace "${WERF_NAMESPACE}" "prometheus=${PROMETHEUS_NAMESPACE_LABEL}" --overwrite
+        fi
+      - werf kubectl -n $WERF_NAMESPACE create secret generic docker-registry-auth-secret
+        --from-file=.dockerconfigjson=$DOCKER_CONFIG_JSON
+        --type=kubernetes.io/dockerconfigjson
+        --save-config --dry-run=client -o yaml | werf kubectl apply -f -
+      - envsubst < .helm/values.yaml > .helm/values.tmpl.yaml
+      - yq -n ".\"$REMOTE_CHART_NAME\" = load(\".helm/values.tmpl.yaml\")" > .helm/values.yaml
+      - >
+        CMD="$EXPANSION_DEPLOY_BEFORE_SCRIPT"
+      - eval $CMD
+    script:
+      - |
+        if [[ ! -f "werf.yaml" ]]; then
+          echo "Creating werf.yaml file"
+          yq -n ".project = \"$WERF_RELEASE\" | \
+                  .configVersion = 1" > werf.yaml
+        fi
+      - |
+        if [[ ! -f ".helm/Chart.yaml" ]]; then
+          echo "Creating .helm/Chart.yaml file"
+          mkdir -p .helm
+          yq -n ".apiVersion = \"v2\" | \
+                  .dependencies.[0] += {\"name\": \"$REMOTE_CHART_NAME\", \
+                                        \"version\": \"$REMOTE_CHART_VERSION\", \
+                                        \"repository\": \"@\" + \"$REMOTE_REPO_ALIAS\"}" > .helm/Chart.yaml
+        fi
+      - cat .helm/Chart.yaml
+      - werf helm repo add "$REMOTE_REPO_ALIAS" "$REMOTE_REPO_URL" --pass-credentials --username "$ARTIFACTORY_USER" --password "$ARTIFACTORY_PASSWORD" --log-quiet
+      - werf helm dependency update .helm --log-quiet
+      - echo "KUBERNETES_CLUSTER_NAME == "$KUBERNETES_CLUSTER_NAME""
+      - echo "WERF_PLAN == "$WERF_PLAN""
+      - |
+        if [[ "$WERF_PLAN" == "false" ]]; then
+          werf converge $WERF_ARGS
+        elif [[ "$WERF_PLAN" == "true" ]]; then
+          werf config render
+          werf plan $WERF_ARGS
+        else
+          echo "Please check WERF_PLAN variable!"
+        fi
+    variables:
+      WERF_NAMESPACE: "${CI_PROJECT_NAME}"
+      CHART_TO_DEPLOY: $CHART_PATH
+      INGRESS_HOST: "${CI_ENVIRONMENT_NAME}.${CI_PROJECT_NAME}.${KUBERNETES_CLUSTER_NAME}.kaas.raiffeisen.ru"
+      INGRESS_HOSTS: "${INGRESS_HOST};${ADDITIONAL_INGRESS_HOSTS}"
+      WERF_PLAN: $WERF_PLAN_MODE
+      WERF_TIMEOUT: "1800"
+      WERF_LOG_COLOR_MODE: "on"
+      WERF_KUBE_CONTEXT: "${GITLAB_AGENT_PROJECT}:${KUBERNETES_CLUSTER_NAME}"
+      WERF_RELEASE: "$CI_PROJECT_NAME"
+      WERF_ATOMIC: "true"
+      WERF_PLAN: "false"  
+    tags:
+    - shared_linux_small_v1
+
+  deploy-to-test:
+    stage: deploy-test
+    extends: .deploy_base
+    variables:
+      KUBERNETES_CLUSTER_NAME: $CLUSTER_NAME_TEST
+    rules:
+      - if: '$SKIP_DEPLOY_TEST != "true" && $DEPLOY_MANUALLY == "true"'
+        when: manual
+      - if: '$SKIP_DEPLOY_TEST != "true" && $DEPLOY_MANUALLY == "false"'
+        when: on_success
+    environment:
+      name: "test"
+      url: "https://$INGRESS_HOST"
+  
+  deploy-to-preview-1:
+    stage: deploy-preview
+    extends: .deploy_base
+    variables:
+      KUBERNETES_CLUSTER_NAME: $CLUSTER_NAME_PREVIEW_1
+    rules:
+      - if: '$SKIP_DEPLOY_PREVIEW_1 != "true" && $DEPLOY_MANUALLY == "true"'
+        when: manual
+      - if: '$SKIP_DEPLOY_PREVIEW_1 != "true" && $DEPLOY_MANUALLY == "false"'
+        when: on_success
+    environment:
+      name: "preview"
+      url: "https://$INGRESS_HOST"
+  
+  deploy-to-preview-2:
+    stage: deploy-preview
+    extends: .deploy_base
+    variables:
+      KUBERNETES_CLUSTER_NAME: $CLUSTER_NAME_PREVIEW_2
+    rules:
+      - if: '$SKIP_DEPLOY_PREVIEW_2 != "true" && $DEPLOY_MANUALLY == "true"'
+        when: manual
+      - if: '$SKIP_DEPLOY_PREVIEW_2 != "true" && $DEPLOY_MANUALLY == "false"'
+        when: on_success
+    environment:
+      name: "preview"
+      url: "https://$INGRESS_HOST"
+  
+  deploy-to-prod-1:
+    stage: deploy-production
+    extends: .deploy_base
+    variables:
+      KUBERNETES_CLUSTER_NAME: $CLUSTER_NAME_PROD_1
+    rules:
+      - if: '$SKIP_DEPLOY_PROD_1 != "true" && $DEPLOY_MANUALLY == "true" && $SKIP_JOBS_FOR_MR != "true"'
+        when: manual
+      - if: '$SKIP_DEPLOY_PROD_1 != "true" && $DEPLOY_MANUALLY == "false" && $SKIP_JOBS_FOR_MR != "true"'
+        when: on_success
+    environment:
+      name: "production"
+      url: https://$INGRESS_HOST
+  
+  deploy-to-prod-2:
+    stage: deploy-production
+    extends: .deploy_base
+    variables:
+      KUBERNETES_CLUSTER_NAME: $CLUSTER_NAME_PROD_2
+    rules:
+      - if: '$SKIP_DEPLOY_PROD_2 != "true" && $DEPLOY_MANUALLY == "true" && $SKIP_JOBS_FOR_MR != "true"'
+        when: manual
+      - if: '$SKIP_DEPLOY_PROD_2 != "true" && $DEPLOY_MANUALLY == "false" && $SKIP_JOBS_FOR_MR != "true"'
+        when: on_success
+    environment:
+      name: "production"
+      url: https://$INGRESS_HOST
+  
+  artifacts-clean-up:
+    stage: clean-up
+    image: $CLEAN_UP
+    before_script:
+      - |
+        echo "Running Artifactory repository cleanup"
+        cd /home/artifacts-clean-up/
+    script:
+      - python -m src.main $ARGS
+    variables:
+      ARTIFACTORY_USER: "$ARTIFACTORY_USER"
+      ARTIFACTORY_PASSWORD: "$ARTIFACTORY_PASSWORD"
+      REPOSITORY_NAME: "$REGISTRY"
+      REPOSITORY_TYPE: $REPOSITORY_TYPE_TO_CLEAN
+      ARTIFACTS_PATH: "${CI_PROJECT_NAME}"
+      ARTIFACTS_TO_KEEP: $ARTIFACTS_KEEP
+      ARTIFACTS_TO_KEEP_REGEX: $ARTIFACTS_KEEP_REGEX
+      ARTIFACTS_TO_KEEP_COUNT_NOT_REGEX: $ARTIFACTS_KEEP_COUNT_NOT_REGEX
+      ARTIFACTS_TO_KEEP_COUNT: $ARTIFACTS_KEEP_COUNT
+      ARGS: "$CLEAN_UP_ARGS"
+    dependencies:
+      - define_docker_registry
+    rules:
+      - if: $SKIP_CLEAN_UP != "true" && $SKIP_JOBS_FOR_MR != "true"
+    interruptible: true
+  
+  artifacts-clean-up-migration:
+    stage: clean-up
+    image: $CLEAN_UP
+    before_script:
+      - |
+        echo "Running Artifactory repository cleanup"
+        cd /home/artifacts-clean-up/
+    script:
+      - python -m src.main $ARGS
+    variables:
+      ARTIFACTORY_USER: "$ARTIFACTORY_USER"
+      ARTIFACTORY_PASSWORD: "$ARTIFACTORY_PASSWORD"
+      REPOSITORY_NAME: "$REGISTRY"
+      REPOSITORY_TYPE: $REPOSITORY_TYPE_TO_CLEAN
+      ARTIFACTS_PATH: "${CI_PROJECT_NAME}-migration"
+      ARTIFACTS_TO_KEEP: $ARTIFACTS_KEEP
+      ARTIFACTS_TO_KEEP_REGEX: $ARTIFACTS_KEEP_REGEX
+      ARTIFACTS_TO_KEEP_COUNT_NOT_REGEX: $ARTIFACTS_KEEP_COUNT_NOT_REGEX
+      ARTIFACTS_TO_KEEP_COUNT: $ARTIFACTS_KEEP_COUNT
+      ARGS: "$CLEAN_UP_ARGS"
+    dependencies:
+      - define_docker_registry
+    rules:
+      - if: $SKIP_CLEAN_UP != "true" && $SKIP_JOBS_FOR_MR != "true" && $SKIP_MIGRATION != "true"
+    interruptible: true
+  
+  create-release:
+    stage: release
+    image: $GITLAB_RELEASE
+    script:
+      - make_notes.py || true
+      - check_version=$(release-cli
+                        --server-url $CI_SERVER_URL
+                        --job-token $CI_JOB_TOKEN
+                        --project-id $CI_PROJECT_ID
+                        get --tag-name $VERSION
+                        2>&1) || 2>/dev/null
+      - if echo "$check_version" | grep -q "404 Not Found"; then
+          echo "Creating a new release";
+            release-cli
+            --server-url $CI_SERVER_URL
+            --job-token $CI_JOB_TOKEN
+            --project-id $CI_PROJECT_ID
+            create
+            --name Release-$CI_PROJECT_NAME-$VERSION
+            --description "${DESCRIPTION}"
+            --tag-name $VERSION
+            --ref $CI_COMMIT_SHA
+            --released-at $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            --assets-link "{\"name\":\"${CI_PROJECT_NAME}\",\"url\":\"${ASSET_URL}\"}" || exit 1;
+        else
+          echo "Version already exists";
+            exit 0;
+        fi
+    variables:
+      ARTIFACTORY_FOLDER: "$REGISTRY"
+      VERSION: "$VERSION"
+      ASSET_URL: "https://${ARTIFACTORY_SERVER}/artifactory/${ARTIFACTORY_FOLDER}/${CI_PROJECT_NAME}"
+      DESCRIPTION: "Artifact can be reached using the following link ${ASSET_URL}"
+    rules:
+      - if: $SKIP_RELEASE != "true" && $SKIP_JOBS_FOR_MR != "true"
+    interruptible: true
+  
