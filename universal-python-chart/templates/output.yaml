@@ -1,0 +1,17 @@
+{{- if .Values.logging.enabled }}
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: Output
+metadata:
+  name: {{ include "universal-python.fullname" . }}-output
+  namespace: {{ .Values.logging.namespace | default "default" }}
+spec:
+  kafka:
+    brokers: {{ .Values.logging.output.brokers }}
+    default_topic: {{ .Values.logging.output.defaultTopic }}
+    format:
+      type: json
+    buffer:
+      {{- range $key, $val := .Values.logging.output.buffer }}
+      {{ $key }}: {{ $val | quote }}
+      {{- end }}
+{{- end }}
