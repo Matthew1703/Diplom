@@ -1,37 +1,3 @@
-# This Dockerfile contains four stages:
-# - deps-image-gitlab
-# - deps-image-local
-# - deps-image
-# - app-image
-#
-# The purpose of the `app-image` stage is to create the final image containing our app.
-# This stage is the one that should be built by kaniko in the `build-app-image` step,
-# and it is defined in `.gitlab-ci.yml` file via `--target app-image` flag.
-#
-# Both `deps-image-gitlab` and `deps-image-local` stages are destined to load and install all necessary dependencies -
-# poetry dependencies in our case.
-#
-# In `deps-image-gitlab` we just copy the virtual environment `.venv` folder and mutate it in order to be consistent
-# with the target container environment.
-#
-# In `deps-image-local` we read Artifactory credentials from `secrets/arti` file, which has the following structure:
-#
-# username
-# password
-#
-# Therefore if we want to run this Dockerfile locally, we should create this `secrets/arti` file, placing `secrets` folder
-# at the project root level.
-#
-# The purpose of the `deps-image` stage as long as the `BUILD_ENVIRONMENT` argument variable
-# is to switch between `deps-image-gitlab` and `deps-image-local` stages while running the `app-image` stage,
-# particularly the `COPY --from` instruction.
-#
-# So in order to run this Dockerfile locally, we should change the `BUILD_ENVIRONMENT` argument variable to "local".
-# You can also see that this argument variable is set to 'gitlab' in the `build-app-image` step
-# in `.gitlab-ci.yml`: `--build-arg BUILD_ENVIRONMENT=gitlab`, because there we want to use `deps-image-gitlab`
-# inside the `COPY --from` instruction of the `app-image` stage.
-#
-
 ARG BASE_IMAGE="artifactory.raiffeisen.ru/python-community-docker/python:3.11.10-slim-rbru"
 ARG BUILD_ENVIRONMENT="local"
 
