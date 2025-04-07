@@ -1,21 +1,4 @@
----
-  include:
-    - project: "devops_community/the-way-of-cicd"
-      ref: '6.8.0'
-      file:
-        - "all-latest-stages/define-registry/define-registry.yml"
-        - "all-latest-stages/version/version.yml"
-        - "all-latest-stages/code-scan/code-scan.yml"
-        - "all-latest-stages/build/build-package.yml"
-        - "all-latest-stages/deploy/deploy.yml"
-        - "all-latest-stages/release/release.yml"
-        - "all-latest-stages/test/allure/send-report.yml"
-        - "all-latest-stages/pipeline/pipeline.yml"
-    - project: "appsec/platform/cicd"
-      file: "main.yml"
-    - local: "variables.yml"
-  
-  workflow:
+    workflow:
     rules:
       - if: $CI_PIPELINE_SOURCE == "merge_request_event"
         variables:
