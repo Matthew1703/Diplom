@@ -287,7 +287,49 @@
     rules:
       - when: always
     interruptible: true
-  
+    
+code_scan: 
+    stage: code-scan
+    image: $SONAR_SCAN
+    before_script:
+        - |
+          if [ ! -z $CI_MERGE_REQUEST_IID ]; then
+            echo "" >> sonar-project.properties
+            echo 'sonar.pullrequest.key=${env.CI_MERGE_REQUEST_IID}' >> sonar-project.properties
+            echo 'sonar.pullrequest.base=${env.CI_MERGE_REQUEST_TARGET_BRANCH_NAME}' >> sonar-project.properties
+            echo 'sonar.pullrequest.branch=${env.CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}' >> sonar-project.properties
+          else
+            echo 'sonar.branch.name=${env.CI_COMMIT_BRANCH}' >> sonar-project.properties
+          fi
+    script:
+        - |
+          if [[ -e sonar-project.properties ]]
+          then
+            sonar-scanner
+          else
+            echo -n "Please create the sonar-project.properties file to the root of your project.
+                     Here is an example of confiugration file for Python:
+                     ---
+                     sonar.projectKey=${env.SONAR_PROJECT_KEY}.${env.CI_PROJECT_NAME}
+                     sonar.projectName=${env.SONAR_PROJECT_KEY}.${env.CI_PROJECT_NAME}
+                     sonar.python.coverage.reportPaths=coverage.xml
+                     sonar.python.xunit.reportPath=junit.xml
+                     sonar.sources=.
+                     sonar.inclusions=**/*.py
+                     sonar.exclusions=**/migrations/*.py,scripts/**,bin/**,alembic/**,tests/**,docs/**,logo/**
+                     sonar.host.url=${env.SONAR_HOST_URL}
+                     sonar.login=${env.SONAR_TOKEN}
+                     sonar.gitlab.commit_sha=${env.CI_COMMIT_SHA}
+                     sonar.gitlab.project_id=${env.CI_PROJECT_ID}
+                     sonar.qualitygate.wait=true
+                     ---"
+            exit 1
+          fi
+    variables:
+        GIT_DEPTH: "0"
+    rules:
+        - if: $SKIP_SONAR_SCAN != "true"
+
   define-migration:
     stage: migration
     image: $PYTHON_IMAGE
